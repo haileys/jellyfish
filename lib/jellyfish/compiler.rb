@@ -29,7 +29,7 @@ module Jellyfish
           raise Jellyfish::Error, "no compiler for opcode '#{opcode[0]}'"
         end
       end
-      "static VALUE Jellyfish_function(VALUE self#{1.upto(@iseq[4][:arg_size]).map { |i| ", VALUE arg_#{i}" }.join}) {\n".tap do |src|
+      "static VALUE jellyfish_function(VALUE self#{1.upto(@iseq[4][:arg_size]).map { |i| ", VALUE arg_#{i}" }.join}) {\n".tap do |src|
         @symbols.each do |name, type|
           src << "#{type} #{name};\n"
         end

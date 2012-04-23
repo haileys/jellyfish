@@ -6,7 +6,7 @@ require "thread"
 
 Jellyfish::Lock = Mutex.new
 
-def Jellyfish(meth)
+def jellyfish(meth)
   meth = method(meth) unless meth.is_a? Method
   raise Jellyfish::Error, "Can't compile variadic methods" if meth.arity < 0
   iseq = Jellyfish.iseq_for_method meth
@@ -22,7 +22,7 @@ def Jellyfish(meth)
       void Init_#{uniqid}() {
         const char* method_name = #{meth.name.to_s.inspect};
         int arity = #{meth.arity};
-        rb_define_method(rb_gv_get("$Jellyfish_method_class"), method_name, Jellyfish_function, arity);
+        rb_define_method(rb_gv_get("$jellyfish_method_class"), method_name, jellyfish_function, arity);
       }
       C
     end
@@ -43,8 +43,8 @@ def Jellyfish(meth)
           ]
           
     `#{cmd.join " "}`
-    $Jellyfish_method_class = meth.owner
+    $jellyfish_method_class = meth.owner
     require file_base
-    $Jellyfish_method_class = nil
+    $jellyfish_method_class = nil
   end
 end
