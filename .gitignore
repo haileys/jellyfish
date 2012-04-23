@@ -16,3 +16,8 @@ tmp
 .yardoc
 _yardoc
 doc/
+
+# c ext crap
+Makefile
+*.o
+*.bundle
