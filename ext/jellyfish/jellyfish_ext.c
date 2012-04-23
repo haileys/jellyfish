@@ -22,7 +22,7 @@ static VALUE iseq_for_method(VALUE self, VALUE meth)
     }
 }
 
-void Init_banana_ext()
+void Init_jellyfish_ext()
 {
     mJellyfish = rb_define_module("Jellyfish");
     rb_define_singleton_method(mJellyfish, "iseq_for_method", iseq_for_method, 1);
