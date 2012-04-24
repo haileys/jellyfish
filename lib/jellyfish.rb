@@ -10,7 +10,7 @@ def jellyfish(meth)
   meth = method(meth) unless meth.is_a? Method
   raise Jellyfish::Error, "Can't compile variadic methods" if meth.arity < 0
   iseq = Jellyfish.iseq_for_method meth
-  compiler = Jellyfish::Compiler.new iseq
+  compiler = Jellyfish::Compiler.new iseq, meth.name.intern
   c_src = compiler.compile
   uniqid = rand 1e20
   file_base = "#{Dir.mktmpdir}/#{uniqid}"
@@ -18,11 +18,14 @@ def jellyfish(meth)
     File.open("#{file_base}.c", "w") do |f|
       f.write <<-C
       #include <ruby.h>
+      #include <math.h>
+      #include <stdlib.h>
+      #include <stdbool.h>
       #{c_src}
       void Init_#{uniqid}() {
         const char* method_name = #{meth.name.to_s.inspect};
         int arity = #{meth.arity};
-        rb_define_method(rb_gv_get("$jellyfish_method_class"), method_name, jellyfish_function, arity);
+        rb_define_method(rb_gv_get("$jellyfish_method_class"), method_name, rb_fn, arity);
       }
       C
     end
