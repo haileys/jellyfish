@@ -1,0 +1,10 @@
+GEM
+  remote: http://rubygems.org/
+  specs:
+    method_source (0.7.1)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  method_source

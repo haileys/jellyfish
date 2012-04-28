@@ -1,231 +1,263 @@
 module Jellyfish
   class Compiler
-    attr_reader :iseq, :opcodes
-  
-    def initialize(iseq, own_method_name)
-      @iseq = iseq.to_a
-      @opcodes = @iseq[13]
-      @num_locals = 0
-      @own_method_name = own_method_name
+    attr_reader :c_src, :ast, :syms
+    
+    def initialize(ast, syms, ext_name)
+      @ast = ast
+      @syms = syms
+      @ext_name = ext_name
     end
-  
+    
     def compile
-      @pseudostack = Hash.new { |h,k| h[k] = [] }
-      @symbols = Hash.new { |h,k| if k.nil? then pry binding else h[k] = :VALUE end }
-      @is_self = {}
-      @locals = {}
-      @src = ""
+      @temp_vars = []
+      @interned = {}
+      @variables = {}
       @stack = []
-      @branch_stack_pointers = {}
-      find_type_signature
-      @opcodes.each do |opcode|
-        if opcode.is_a? Fixnum
-          output "// line #{opcode}"
-          next
-        end
-        if opcode.is_a? Symbol
-          if @branch_stack_pointers[opcode]
-            while @stack.size > @branch_stack_pointers[opcode]
-              pop
+      @c_src = ""
+      @indent = 0
+      # look for type declaration:
+      if @ast.is_a? AST::MethodDefinition and @ast.body.stmts.first.is_a? AST::Call
+        call = @ast.body.stmts.first
+        if call.receiver.is_a? AST::Self and call.name == "types"
+          # found it!
+          unless call.args.size == 1 and call.args[0].is_a? AST::Hash
+            error! "argument to 'types' must be a Hash"
+          end
+          call.args[0].pairs.each do |key,value|
+            error! "type must be a symbol" unless value.is_a? AST::Symbol
+            case key
+            when AST::Variable; syms[key.name] = Types[value.name.intern]
+            when AST::Symbol
+              if key.name == "returns"
+                syms.returns = Types[value.name.intern]
+              else
+                error! "Unknown variable in type declaration"
+              end
+            else
+              error! "Unknown variable in type declaration"
             end
           end
-          output "#{opcode}:"
-          next
-        end
-        meth = "op_#{opcode[0]}"
-        if respond_to? meth, true
-          send meth, *opcode[1..-1]
-        else
-          require "pry"
-          pry binding
-          raise Jellyfish::Error, "no compiler for opcode '#{opcode[0]}'"
         end
       end
-      "".tap do |src|
-        src << "static #{@return_type || :VALUE} fn(VALUE self#{1.upto(@iseq[4][:arg_size]).map { |i| ", #{@locals[2 + @iseq[4][:arg_size] - i]} arg_#{i}" }.join}) {\n"
-        @symbols.each do |name, type|
-          src << "#{type} #{name};\n"
-        end
-        1.upto(@iseq[4][:local_size]) do |i|
-          src << "#{@locals[i] ||= :VALUE} local_#{i};\n"
-        end
-        1.upto(@iseq[4][:arg_size]) do |i|
-          local_idx = 2 + @iseq[4][:arg_size] - i
-          src << "local_#{local_idx} = arg_#{i};\n"
-        end
-        src << @src << "}\n"
-        
-        src << "static VALUE rb_fn(VALUE self#{1.upto(@iseq[4][:arg_size]).map { |i| ", VALUE arg_#{i}" }.join}) {\n"
-        src << "#{@return_type || :VALUE} retn = fn(self"
-        1.upto(@iseq[4][:arg_size]) do |i|
-          local_idx = 2 + @iseq[4][:arg_size] - i
-          case @locals[local_idx]
-          when :VALUE;  src << ", arg_#{i}"
-          when :int;    src << ", FIX2INT(arg_#{i})"
-          when :bool;   src << ", RTEST(arg_#{i}) ? true : false"
-          end
-        end
-        src << ");\n"
-        case @return_type || :VALUE
-        when :int;    src << "return INT2FIX(retn);\n"
-        when :bool;   src << "return retn ? Qtrue : Qfalse;\n"
-        when :VALUE;  src << "return retn;\n"
-        end
-        src << "}"
-      end
+      compile_node @ast, nil
+    end
+    
+  private
+    def error!(message)
+      raise Jellyfish::Error, message
     end
   
-  private  
-    def find_type_signature
-      idx = @opcodes.each_with_index.select { |x| x.is_a? Array }
-          .find { |op,idx| op[0] == :send and op[1] == :types }[1]
-      sl = @opcodes[1...idx].reject { |op,*| op == :trace }
-      if sl[0][0] != :putself or sl[-1][0] != :newhash
-        raise Jellyfish::Error, "Missing type signature"
-      end
-      valid_types = [:VALUE, :int, :bool]
-      sl[1...-1].each_slice(2) do |a,b|
-        raise Jellyfish::Error, "Unknown type '#{b[1]}'" unless valid_types.include? b[1]
-        if a[1] == :returns
-          @return_type = b[1]
-        else
-          @locals[a[1]] = b[1]
-        end
-      end
-      @opcodes = @opcodes[(idx+1)..-1]
+    def type_of(obj)
+      obj.class.name.split("::").last.intern
     end
   
+    def temp_var(type)
+      n = @temp_vars.size
+      @temp_vars << type
+      "$#{n}"
+    end
+    
+    def intern_symbol(symbol)
+      @interned[symbol.to_s] ||= "sym_#{@interned.count}"
+    end
+    
     def output(line)
-      @src << "// STACK: #{@stack.inspect}\n"
-      @src << "#{line}\n"
-    end
-  
-    def push(type)
-      slot = @pseudostack[type].find { |name,available| available }
-      if slot
-        slot[1] = false
-        @stack.push slot[0]
-        slot[0]
-      else
-        name = "st_#{@symbols.count}"
-        @pseudostack[type] << [name, false]
-        @symbols[name] = type
-        @stack.push name
-        name
-      end
-    end
-  
-    def pop
-      return unless @stack.any?
-      @stack.pop.tap do |name|
-        @pseudostack[@symbols[name]].find { |n,*| n == name }[1] = true
-        @is_self.delete name
-      end
+      c_src << "#{"    " * @indent}#{line}\n"
     end
     
-    def stack_element_is_self?(el = 1)
-      @is_self[@stack[-el]]
-    end
-
-    def op_trace(*)
-      #
+    def indent
+      @indent += 1
+      yield
+    ensure
+      @indent -= 1
     end
   
-    def op_getlocal(slot)
-      output "#{push(@locals[slot] ||= :VALUE)} = local_#{slot};"
+    def node
+      @stack.last[0]
     end
     
-    def op_leave(*)
-      slot = pop
-      if @return_type != @symbols[slot]
-        require "pry"
-        pry binding
-        raise Jellyfish::Error, "returning incorrect type (expected #{@return_type}, got #{@symbols[slot]})"
+    def return_var
+      @stack.last[1]
+    end
+  
+    def compile_node(node, return_in)
+      @stack << [node, return_in]
+      send type_of(node)
+      @stack.pop
+    end
+    
+    def MethodDefinition
+      return_type = node.type syms
+      return_var = temp_var return_type
+      indent do
+        compile_node node.body, return_var
+        output "return #{return_var};"
+      end
+      inner_src, @c_src = @c_src, ""
+      c_args = node.args.map { |arg| ", #{syms[arg].ctype} #{arg}" }
+      
+      output "#include <ruby.h>"
+      output "#include <stdlib.h>"
+      output "#include <stdbool.h>"
+      output "#include <math.h>"
+      
+      if @interned.any?
+        output "ID #{@interned.values.join ", "};"
       end
       
-      if @return_type == :VALUE
-        case @symbols[slot]
-        when :int;    output "return INT2FIX(#{slot});"
-        when :bool;   output "return #{slot} ? Qtrue : Qfalse;"
-        when :VALUE;  output "return #{slot};"
-        else
-          pry binding
-        end
-      else
-        output "return #{slot};"
-      end
-    end
-    
-    { plus: "+", minus: "-" }.each do |name,op|
-      define_method "op_opt_#{name}" do |*|
-        b = pop
-        a = pop
-        if @symbols[a] == :int and @symbols[b] == :int
-          output "#{push :int} = #{a} #{op} #{b};"
-        else
-          output "#{push :VALUE} = rb_funcall(#{a}, rb_intern(\"#{op}\"), 1, #{b});"
+      output "static #{return_type.ctype} fn(VALUE self#{c_args.join})"
+      output "{"
+      indent do
+        @temp_vars.each_with_index.group_by(&:first).each do |type, vars|
+          output "#{type.ctype} #{vars.map { |v| "$#{v[1]}" }.join ", "};"
         end
       end
+      output inner_src
+      output "}"
+      
+      output "static VALUE rb_fn(VALUE self#{node.args.map { |arg| ", VALUE #{arg}" }.join})"
+      output "{"
+      indent do
+        fmt = return_type.convert_to(Types[:VALUE])
+        arg_list = ""
+        node.args.each do |arg|
+          arg_list << ", "
+          arg_list << sprintf(syms[arg].convert_from(Types[:VALUE]), arg)
+        end
+        output "#{return_type.ctype} retn = fn(self#{arg_list});"
+        output sprintf("return #{fmt};", "retn")
+      end
+      output "}"
+      
+      output "void Init_#{@ext_name}()"
+      output "{"
+      indent do
+        @interned.each do |sym, var|
+          output "#{var} = rb_intern(\"#{sym}\");"
+        end
+        output "rb_define_method(rb_gv_get(\"$jellyfish_method_class\"), #{syms.own_method_name.to_s.inspect}, rb_fn, #{node.args.size});"
+      end
+      output "}"
     end
     
-    def op_opt_le(*)
-      b = pop
-      a = pop
-      if @symbols[a] == :int and @symbols[b] == :int
-        output "#{push :bool} = (#{a} <= #{b});"
-      else
-        output "#{push :VALUE} = rb_funcall(#{a}, rb_intern(\"<=\"), 1, #{b});"
+    def Body
+      *init, last = node.stmts
+      init.each { |x| compile_node x, nil }
+      compile_node last, return_var
+    end
+    
+    { Addition: :+, Subtraction: :-, Multiplication: :*, Division: :/ }.each do |name, oper|
+      define_method name do
+        fmt = return_var ? "#{return_var} = %s;" : "(void)(%s);"
+        left = node.left.type syms
+        right = node.right.type syms
+        common = left.common_type right
+        lvar = temp_var left
+        rvar = temp_var right
+        case common
+        when Types[:VALUE]; expr = "rb_funcall(#{left.convert_to common}, #{intern_symbol oper}, 1, #{right.convert_to common})"
+        when Types[:int];   expr = "#{left.convert_to common} #{oper} #{right.convert_to common}"
+        else error! "unknown type in #{name.downcase}: #{common.ctype}"
+        end
+        compile_node node.left, lvar
+        compile_node node.right, rvar
+        output sprintf(sprintf(fmt, expr), lvar, rvar)
       end
     end
     
-    def op_pop
-      pop
-    end
-    
-    def op_putobject(obj)
-      case obj
-      when Fixnum;  output "#{push :int} = #{obj};"
-      else pry binding
+    { Equality: :==, Inequality: :!=, LessThan: :<, LessThanEquals: :<=, GreaterThan: :>, GreaterThanEquals: :>= }.each do |name,oper|
+      define_method name do
+        fmt = return_var ? "#{return_var} = %s;" : "(void)(%s);"
+        eq_type = node.type syms
+        left = node.left.type syms
+        right = node.right.type syms
+        lvar = temp_var left
+        rvar = temp_var right
+        case eq_type
+        when Types[:VALUE]; expr = "rb_funcall(#{left.convert_to eq_type}, #{intern_symbol oper}, 1, #{right.convert_to eq_type})"
+        when Types[:bool];  expr = "(%s #{oper} %s)"
+        else error! "unknown type in addition: #{eq_type.ctype}"
+        end
+        compile_node node.left, lvar
+        compile_node node.right, rvar
+        output sprintf(sprintf(fmt, expr), lvar, rvar)
       end
     end
     
-    def op_branchunless(lbl)
-      slot = pop
-      case @symbols[slot]
-      when :int;    output "goto #{lbl};"
-      when :bool;   output "if(!#{slot}) goto #{lbl};"
-      when :VALUE;  output "if(!RTEST(#{slot})) goto #{lbl};"
+    def Variable
+      @variables[node.name] = true
+      output "#{return_var} = #{node.name};" if return_var
+    end
+    
+    def Call
+      if node.receiver.is_a? AST::Self and node.name == "types"
+        # this is a type declaration, ignore
+      elsif node.receiver.is_a? AST::Self and node.name == syms.own_method_name
+        # self recursion
+        unless @ast.args.size == node.args.size
+          error! "Wrong number of arguments in self recursion"
+        end
+        call_arg_types = node.args.map { |a| a.type syms }
+        meth_arg_types = @ast.args.map { |a| syms[a] }
+        temp_vars = call_arg_types.map { |t| temp_var t }
+        node.args.zip(temp_vars).each { |arg,var| compile_node arg, var }
+        args = ["self"] + temp_vars.each_with_index { |v,i| sprintf call_arg_types[i].convert_to(meth_arg_types[i]), v }
+        if return_var
+          output "#{return_var} = fn(#{args.join ", "});"
+        else
+          output "fn(#{args.join ", "});"
+        end
       else
         pry binding
       end
-      @branch_stack_pointers[lbl] = @stack.size
     end
     
-    def op_jump(lbl)
-      output "goto #{lbl};"
-    end
-    
-    def op_putself
-      slot = push :VALUE
-      @is_self[slot] = true
-      output "#{slot} = self;"
-    end
-    
-    def op_send(meth, arity, *args)
-      if stack_element_is_self?(arity + 1) and meth == @own_method_name
-        if arity != @iseq[4][:arg_size]
-          raise Banana::Error, "calling self with incorrect argument length"
-        end
-        arg_types = 1.upto(@iseq[4][:arg_size]).map { |i| @locals[2 + @iseq[4][:arg_size] - i]}
-        if @stack[-arity..-1].map { |x| @symbols[x] } != arg_types
-          raise Banana::Error, "calling self with invalid types"
-        end
-        call_args = arity.times.map { pop }
-        pop # pop self
-        output "#{push @return_type} = fn(self, #{call_args.reverse.join ", "});"
-      else
-        #
+    def Integer
+      if return_var
+        output "#{return_var} = #{node.int};"
       end
+    end
+    
+    def If
+      if_type = node.type syms
+      cond_type = node.cond.type syms
+      cond_var = temp_var cond_type
+      compile_node node.cond, cond_var
+      output "if(#{sprintf cond_type.convert_to(Types[:bool]), cond_var}) {"
+      indent do
+        *init, last = node.then_stmts
+        init.each do |stmt|
+          compile_node stmt, nil
+        end
+        if return_var
+          then_type = last.type syms
+          then_type = if_type if then_type.is_a? Types::SelfRecursion
+          then_var = temp_var then_type
+          compile_node last, then_var
+          output "#{return_var} = #{sprintf then_type.convert_to(if_type), then_var};"
+        else
+          compile_node node.then_stmts, nil
+        end
+      end
+      output "} else {"
+      indent do
+        if node.else_stmts
+          *init, last = node.else_stmts
+          init.each do |stmt|
+            compile_node stmt, nil
+          end
+          if return_var
+            else_type = last.type syms
+            else_type = if_type if else_type.is_a? Types::SelfRecursion
+            else_var = temp_var else_type
+            compile_node last, else_var
+            output "#{return_var} = #{sprintf else_type.convert_to(if_type), else_var};"
+          else
+            compile_node node.then_stmts, nil
+          end
+        end
+      end
+      output "}"
     end
   end
 end
